@@ -1,7 +1,7 @@
 import mesa
 from mesa.space import MultiGrid
 from mesa.datacollection import DataCollector
-
+import matplotlib.pyplot as plt
 
 class ForestPatch(mesa.Agent): # The Agent, each forest patch (grid) is an "agent"
     def __init__(self, model, tree_density, soil_moisture, carbon, state):  #runs everytime a new patch is created
@@ -63,16 +63,27 @@ class ForestPatch(mesa.Agent): # The Agent, each forest patch (grid) is an "agen
         self.state = self.next_state
 
 class ForestModel(mesa.Model):     #entire forest simulation
-    def __init__(self, width, height):
-        super().__init__()   #proper model initialisation
+    def __init__(
+            self,
+            width,
+            height,
+            base_drying_rate=0.03,
+            rainfall=0.01,
+            density_min=0.4,
+            density_max=0.9,
+            seed=None
+    ):
+        super().__init__(seed=seed)   #proper model initialisation
 
-        self.base_drying_rate = 0.03
-        self.rainfall = 0.01
+        self.base_drying_rate = base_drying_rate
+        self.rainfall = rainfall
+        self.density_min = density_min
+        self.density_max = density_max
 
         self.grid = MultiGrid(width, height, torus=False) #creates a 2D grid. torus being false ensures no wrap-around of effects
         for x in range(width):
             for y in range(height):
-                tree_density = self.random.uniform(0.4, 0.9)
+                tree_density = self.random.uniform(self.density_min, self.density_max)
                 soil_moisture = self.random.uniform(0.2, 0.8)
                 carbon = tree_density * 100
                 state = "healthy"
@@ -105,6 +116,16 @@ class ForestModel(mesa.Model):     #entire forest simulation
         self.agents.do("advance")
         self.datacollector.collect(self)
 
+def run_scenario(name, steps, **model_kwargs):
+    model = ForestModel(5,5, **model_kwargs)
+
+    for _ in range(steps):
+        model.step()
+
+    results = model.datacollector.get_model_vars_dataframe()
+    results["Scenario"] = name
+    return results
+
 if __name__ == "__main__":
     model = ForestModel(5, 5)
     print("Model created successfully")
@@ -122,18 +143,81 @@ if __name__ == "__main__":
             f"State={patch.state}"
         )
 
-    for i in range(5):
+    for i in range(30):
         model.step()
-        print(f"\nAfter step {i+1}:")
-        for j, patch in enumerate(patches[:5], start=1):
-            print(
-                f"Patch {j}: "
-                f"Density={patch.tree_density:.2f}, "
-                f"Moisture={patch.soil_moisture:.2f}, "
-                f"Carbon={patch.carbon:.2f}, "
-                f"State={patch.state}"
-            )
+        # print(f"\nAfter step {i+1}:")
+        # for j, patch in enumerate(patches[:5], start=1):
+        #     print(
+        #         f"Patch {j}: "
+        #         f"Density={patch.tree_density:.2f}, "
+        #         f"Moisture={patch.soil_moisture:.2f}, "
+        #         f"Carbon={patch.carbon:.2f}, "
+        #         f"State={patch.state}"
+        #     )
     
+    baseline = run_scenario(
+        "Baseline",
+        30,
+        base_drying_rate=0.03,
+        rainfall=0.01,
+        density_min=0.4,
+        density_max=0.9,
+        seed=42
+    )
+
+    drought = run_scenario(
+        "Drought",
+        30,
+        base_drying_rate=0.05,
+        rainfall=0.003,
+        density_min=0.4,
+        density_max=0.9,
+        seed=42
+    )
+
+    afforestation = run_scenario(
+        "Afforestation",
+        30,
+        base_drying_rate=0.03,
+        rainfall=0.01,
+        density_min=0.65,
+        density_max=1.0,
+        seed=42
+    )
+
     results = model.datacollector.get_model_vars_dataframe()
     print("\nModel-level results:")
     print(results)
+
+    plt.figure()
+    plt.plot(results["TotalCarbon"])
+    plt.xlabel("Step")
+    plt.ylabel("Total Carbon")
+    plt.title("Total Carbon Over Time")
+    plt.show()
+
+    plt.figure()
+    plt.plot(results["StressedCount"])
+    plt.xlabel("Step")
+    plt.ylabel("Stressed Patches")
+    plt.title("Stressed Patches Over Time")
+    plt.show()
+
+    plt.figure()
+    plt.plot(results["AverageMoisture"])
+    plt.xlabel("Step")
+    plt.ylabel("Average Moisture")
+    plt.title("Average Moisture Over Time")
+    plt.show()
+
+    plt.figure()
+    plt.plot(baseline["TotalCarbon"], label="Baseline")
+    plt.plot(drought["TotalCarbon"], label="Drought")
+    plt.plot(afforestation["TotalCarbon"], label="Afforestation")
+    plt.xlabel("Step")
+    plt.ylabel("Total Carbon")
+    plt.title("Scenario Comparison: Total Carbon")
+    plt.legend()
+    plt.show()
+
+
