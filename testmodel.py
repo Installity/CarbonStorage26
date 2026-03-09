@@ -9,19 +9,19 @@ def clamp(value, low, high):           #HELPER FUNCTION
     return max(low, min(high, value))  #keeps values between a min and max. clamp(value, min, max)
 
 
-def load_sensor_baseline(csv_path):
+def load_sensor_baseline(csv_path, rows_to_average=10):
     df = pd.read_csv(csv_path)
 
     if df.empty:
         raise ValueError("CSV file empty. Ensure no file corruption, or incorrect file input.")
 
-    latest = df.iloc[-1]
+    recent = df.tail(rows_to_average)
 
     return {
-        "temp_c": float(latest["T_C"]),
-        "rh_pct": float(latest["RH_pct"]),
-        "soil_pct": float(latest["Soil_pct"]),
-        "light_d0": float(latest["LightD0"]),
+        "temp_c": float(recent["T_C"].mean()),
+        "rh_pct": float(recent["RH_pct"].mean()),
+        "soil_pct": float(recent["Soil_pct"].mean()),
+        "light_d0": float(recent["LightD0"].mean()),
     }
 
 class ForestPatch(mesa.Agent): # The Agent, each forest patch (grid) is an "agent"
@@ -57,16 +57,6 @@ class ForestPatch(mesa.Agent): # The Agent, each forest patch (grid) is an "agen
     
         stress_pressure = stressed_neighbors * 0.01 # 5 stressed neighbours = 0.05 stresspressure
 
-        stress_ratio = stressed_neighbors / max(1, len(neighbors))
-        self.fire_risk = (
-            (1 - self.soil_moisture) * 0.5
-            +stress_ratio * 0.3
-            +(1 if self.state == "stressed" else 0) * 0.2
-        )
-
-        self.fire_risk = clamp(self.fire_risk, 0, 1)
-
-
         self.soil_moisture = (
             self.soil_moisture
             - drying_rate
@@ -79,11 +69,22 @@ class ForestPatch(mesa.Agent): # The Agent, each forest patch (grid) is an "agen
             self.soil_moisture = 0
         if self.soil_moisture > 1:
             self.soil_moisture = 1
-        if self.soil_moisture < 0.3:
-            self.next_state = "stressed"
-        else:
-            self.next_state = "healthy"
 
+        # Recalculate fire risk AFTER moisture update
+        stress_ratio = stressed_neighbors / max(1, len(neighbors))
+        self.fire_risk = (
+            (1 - self.soil_moisture) * 0.5
+            + stress_ratio * 0.3
+            + (1 if self.state == "stressed" else 0) * 0.2
+        )
+        self.fire_risk = clamp(self.fire_risk, 0, 1)
+
+        burning_neighbors = 0
+        for neighbor in neighbors:
+            if neighbor.state == "burning":
+                burning_neighbors += 1
+
+        # Carbon update based on CURRENT state
         if self.state == "healthy":
             self.carbon += 2 * self.tree_density
         elif self.state == "stressed":
@@ -96,27 +97,24 @@ class ForestPatch(mesa.Agent): # The Agent, each forest patch (grid) is an "agen
         if self.carbon < 0:
             self.carbon = 0
 
-        burning_neighbors = 0
-        for neighbor in neighbors:
-            if neighbor.state == "burning":
-                burning_neighbors += 1
-
+        # Final state decision
         if self.state == "burning":
             self.next_state = "burned"
 
-        elif self.state != "burned":
-            ignition_threshold = 0.75
+        elif self.state == "burned":
+            self.next_state = "burned"
 
-            if self.fire_risk >= ignition_threshold:
-                self.next_state = "burning"
+        elif self.fire_risk >= self.model.ignition_threshold:
+            self.next_state = "burning"
 
-            elif burning_neighbors > 0 and self.fire_risk >= 0.55:
-                self.next_state = "burning"
+        elif burning_neighbors > 0 and self.fire_risk >= self.model.spread_threshold:
+            self.next_state = "burning"
 
-            elif self.soil_moisture < 0.3:
-                self.next_state = "stressed"
-            else:
-                self.next_state = "healthy"
+        elif self.soil_moisture < 0.3:
+            self.next_state = "stressed"
+
+        else:
+            self.next_state = "healthy"
 
 
         #print(f"Density={self.tree_density:.2f}, drying={drying_rate:.3f}, moisture={self.soil_moisture:.2f}")
@@ -136,6 +134,8 @@ class ForestModel(mesa.Model):     #entire forest simulation
             density_min=0.4,
             density_max=0.9,
             adaptive_enabled=True,
+            ignition_threshold=0.75,
+            spread_threshold=0.55,
             seed=None
     ):
         super().__init__(seed=seed)   #proper model initialisation
@@ -150,6 +150,9 @@ class ForestModel(mesa.Model):     #entire forest simulation
             self.base_soil_moisture = 0.5
             self.base_temp_c = 20.0
             self.base_rh = 0.6
+
+        self.ignition_threshold = ignition_threshold  #own model design, allows me to make wildfire escalation
+        self.spread_threshold = spread_threshold # a proper scenario by changing thresholds.
 
         calculated_drying_rate = (0.02 + max(0, self.base_temp_c - 20) * 0.0015 + (1- self.base_rh) * 0.01)
 
@@ -169,7 +172,7 @@ class ForestModel(mesa.Model):     #entire forest simulation
         self.adaptive_enabled = adaptive_enabled #ADAPTIVE SYSTEM TOGGLE (in ForestModel(x,y, adaptive_enabled=True/False))
         self.alert = False 
         self.irrigation_boost = 0.0 #Dynamically changing Irrigation Boost
-        self.stress_threshold = 0.40 #if more than 40% of patches are stressed, enable adaptive system
+        self.stress_threshold = 0.25 #if more than 25% of patches are stressed, enable adaptive system
 
         self.grid = MultiGrid(width, height, torus=False) #creates a 2D grid. torus being false ensures no wrap-around of effects
         for x in range(width):
@@ -234,8 +237,8 @@ class ForestModel(mesa.Model):     #entire forest simulation
         self.agents.do("advance") #patch update
         self.datacollector.collect(self) #collect results
 
-def run_scenario(name, steps, **model_kwargs):
-    model = ForestModel(5,5, **model_kwargs)
+def run_scenario(name, steps, width=20, height=20, **model_kwargs):
+    model = ForestModel(width,height, **model_kwargs)
 
     for _ in range(steps):
         model.step()
@@ -300,6 +303,19 @@ if __name__ == "__main__":
         seed=42
     )
 
+    wildfire = run_scenario( #lower canopy protection, easier ignition, easier spread scenario
+        "Wildfire Escalation",
+        30,
+        csv_path="sensor_data.csv",
+        base_drying_rate=0.04,
+        rainfall=0.006,
+        density_min=0.25,
+        density_max=0.65,
+        ignition_threshold=0.60,
+        spread_threshold=0.45,
+        seed=42
+    )  
+
     afforestation = run_scenario(
         "Afforestation",
         30,
@@ -363,7 +379,7 @@ if __name__ == "__main__":
     plt.figure()
     plt.plot(baseline["TotalCarbon"], label="Baseline")
     plt.plot(drought["TotalCarbon"], label="Drought")
-    plt.plot(afforestation["TotalCarbon"], label="Afforestation")
+    plt.plot(afforestation["TotalCarbon"], label="Wildfire Escalation")
     plt.xlabel("Step")
     plt.ylabel("Total Carbon")
     plt.title("Scenario Comparison: Total Carbon")
@@ -416,5 +432,44 @@ if __name__ == "__main__":
     plt.xlabel("Step")
     plt.ylabel("Alert State")
     plt.title("Adaptive Alert Activation")
+    plt.legend()
+    plt.show()
+
+    plt.figure()
+    plt.plot(results["AverageFireRisk"])
+    plt.xlabel("Step")
+    plt.ylabel("Average Fire Risk")
+    plt.title("Average Fire Risk Over Time")
+    plt.show()
+
+    plt.figure()
+    plt.plot(results["BurningCount"])
+    plt.xlabel("Step")
+    plt.ylabel("Burning Patches")
+    plt.title("Burning Patches Over Time")
+    plt.show()
+
+    plt.figure()
+    plt.plot(results["BurnedCount"])
+    plt.xlabel("Step")
+    plt.ylabel("Burned Patches")
+    plt.title("Burned Patches Over Time")
+    plt.show()
+
+    plt.figure()
+    plt.plot(drought["AverageFireRisk"], label="Drought")
+    plt.plot(wildfire["AverageFireRisk"], label="Wildfire Escalation")
+    plt.xlabel("Step")
+    plt.ylabel("Average Fire Risk")
+    plt.title("Scenario Comparison: Fire Risk")
+    plt.legend()
+    plt.show()
+
+    plt.figure()
+    plt.plot(drought["BurnedCount"], label="Drought")
+    plt.plot(wildfire["BurnedCount"], label="Wildfire Escalation")
+    plt.xlabel("Step")
+    plt.ylabel("Burned Patches")
+    plt.title("Scenario Comparison: Burned Patches")
     plt.legend()
     plt.show()
