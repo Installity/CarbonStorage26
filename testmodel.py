@@ -33,10 +33,12 @@ class ForestPatch(mesa.Agent): # The Agent, each forest patch (grid) is an "agen
         self.carbon = carbon
         self.state = state
         self.next_state = state
+        self.fire_risk = 0.0
 
     def step(self):   #runs every simulation tick, == patch's behavior.
         canopy_protection = self.tree_density * 0.02 #soil drying out each tick
         drying_rate = self.model.base_drying_rate - canopy_protection
+
 
         if drying_rate < 0:
             drying_rate = 0
@@ -54,6 +56,16 @@ class ForestPatch(mesa.Agent): # The Agent, each forest patch (grid) is an "agen
                 stressed_neighbors += 1
     
         stress_pressure = stressed_neighbors * 0.01 # 5 stressed neighbours = 0.05 stresspressure
+
+        stress_ratio = stressed_neighbors / max(1, len(neighbors))
+        self.fire_risk = (
+            (1 - self.soil_moisture) * 0.5
+            +stress_ratio * 0.3
+            +(1 if self.state == "stressed" else 0) * 0.2
+        )
+
+        self.fire_risk = clamp(self.fire_risk, 0, 1)
+
 
         self.soil_moisture = (
             self.soil_moisture
@@ -74,11 +86,37 @@ class ForestPatch(mesa.Agent): # The Agent, each forest patch (grid) is an "agen
 
         if self.state == "healthy":
             self.carbon += 2 * self.tree_density
-        else:
+        elif self.state == "stressed":
             self.carbon -= 1
+        elif self.state == "burning":
+            self.carbon -= 5
+        elif self.state == "burned":
+            self.carbon -= 2
 
         if self.carbon < 0:
             self.carbon = 0
+
+        burning_neighbors = 0
+        for neighbor in neighbors:
+            if neighbor.state == "burning":
+                burning_neighbors += 1
+
+        if self.state == "burning":
+            self.next_state = "burned"
+
+        elif self.state != "burned":
+            ignition_threshold = 0.75
+
+            if self.fire_risk >= ignition_threshold:
+                self.next_state = "burning"
+
+            elif burning_neighbors > 0 and self.fire_risk >= 0.55:
+                self.next_state = "burning"
+
+            elif self.soil_moisture < 0.3:
+                self.next_state = "stressed"
+            else:
+                self.next_state = "healthy"
 
 
         #print(f"Density={self.tree_density:.2f}, drying={drying_rate:.3f}, moisture={self.soil_moisture:.2f}")
@@ -155,6 +193,9 @@ class ForestModel(mesa.Model):     #entire forest simulation
                 "AverageMoisture": ForestModel.average_moisture,
                 "Alert": lambda m: int(m.alert), #stores alert on/off as number 1 or 0
                 "IrrigationBoost": lambda m: m.irrigation_boost,
+                "AverageFireRisk": ForestModel.average_fire_risk,
+                "BurningCount": ForestModel.burning_count,
+                "BurnedCount": ForestModel.burned_count,
             }
         )
         self.datacollector.collect(self)
@@ -167,6 +208,15 @@ class ForestModel(mesa.Model):     #entire forest simulation
 
     def average_moisture(self):
         return sum(agent.soil_moisture for agent in self.agents) / len(self.agents)
+    
+    def average_fire_risk(self):
+        return sum(agent.fire_risk for agent in self.agents) /len(self.agents)
+    
+    def burning_count(self):
+        return sum(1 for agent in self.agents if agent.state == "burning")
+    
+    def burned_count(self):
+        return sum(1 for agent in self.agents if agent.state == "burned")
     
     def update_adaptive_response(self):
         stressed_ratio = self.stressed_count() / len(self.agents)
@@ -195,7 +245,7 @@ def run_scenario(name, steps, **model_kwargs):
     return results
 
 if __name__ == "__main__":
-    model = ForestModel(5, 5, seed=42)
+    model = ForestModel(20, 20, csv_path="sensor_data.csv", seed=42)
     print("Model created successfully")
     print("Number of agents:", len(model.agents))
 
