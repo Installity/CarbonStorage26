@@ -1,7 +1,28 @@
 import mesa
 from mesa.space import MultiGrid
 from mesa.datacollection import DataCollector
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt #visualisation/plotting
+import pandas as pd # required to read CSV file into dataframe [pandas.read_csv()]
+
+#CSV READING
+def clamp(value, low, high):           #HELPER FUNCTION
+    return max(low, min(high, value))  #keeps values between a min and max. clamp(value, min, max)
+
+
+def load_sensor_baseline(csv_path):
+    df = pd.read_csv(csv_path)
+
+    if df.empty:
+        raise ValueError("CSV file empty. Ensure no file corruption, or incorrect file input.")
+
+    latest = df.iloc[-1]
+
+    return {
+        "temp_c": float(latest["T_C"]),
+        "rh_pct": float(latest["RH_pct"]),
+        "soil_pct": float(latest["Soil_pct"]),
+        "light_d0": float(latest["LightD0"]),
+    }
 
 class ForestPatch(mesa.Agent): # The Agent, each forest patch (grid) is an "agent"
     def __init__(self, model, tree_density, soil_moisture, carbon, state):  #runs everytime a new patch is created
@@ -35,7 +56,11 @@ class ForestPatch(mesa.Agent): # The Agent, each forest patch (grid) is an "agen
         stress_pressure = stressed_neighbors * 0.01 # 5 stressed neighbours = 0.05 stresspressure
 
         self.soil_moisture = (
-            self.soil_moisture - drying_rate - stress_pressure + self.model.rainfall
+            self.soil_moisture
+            - drying_rate
+            - stress_pressure
+            + self.model.rainfall
+            + self.model.irrigation_boost
         )
 
         if self.soil_moisture < 0:
@@ -67,24 +92,54 @@ class ForestModel(mesa.Model):     #entire forest simulation
             self,
             width,
             height,
-            base_drying_rate=0.03,
-            rainfall=0.01,
+            csv_path=None,
+            base_drying_rate=None,
+            rainfall=None,
             density_min=0.4,
             density_max=0.9,
+            adaptive_enabled=True,
             seed=None
     ):
         super().__init__(seed=seed)   #proper model initialisation
 
-        self.base_drying_rate = base_drying_rate
-        self.rainfall = rainfall
+        if csv_path is not None:
+            sensor = load_sensor_baseline(csv_path)
+
+            self.base_soil_moisture = clamp(sensor["soil_pct"] / 100.0, 0, 1)
+            self.base_temp_c = sensor["temp_c"]
+            self.base_rh = clamp(sensor["rh_pct"] / 100.0, 0, 1)
+        else:  #fallback to default values if fails
+            self.base_soil_moisture = 0.5
+            self.base_temp_c = 20.0
+            self.base_rh = 0.6
+
+        calculated_drying_rate = (0.02 + max(0, self.base_temp_c - 20) * 0.0015 + (1- self.base_rh) * 0.01)
+
+        if base_drying_rate is None:
+            self.base_drying_rate = calculated_drying_rate
+        else:
+            self.base_drying_rate = base_drying_rate
+
+        if rainfall is None:
+            self.rainfall = 0.01
+        else:
+            self.rainfall = rainfall
+
         self.density_min = density_min
         self.density_max = density_max
+
+        self.adaptive_enabled = adaptive_enabled #ADAPTIVE SYSTEM TOGGLE (in ForestModel(x,y, adaptive_enabled=True/False))
+        self.alert = False 
+        self.irrigation_boost = 0.0 #Dynamically changing Irrigation Boost
+        self.stress_threshold = 0.40 #if more than 40% of patches are stressed, enable adaptive system
 
         self.grid = MultiGrid(width, height, torus=False) #creates a 2D grid. torus being false ensures no wrap-around of effects
         for x in range(width):
             for y in range(height):
                 tree_density = self.random.uniform(self.density_min, self.density_max)
-                soil_moisture = self.random.uniform(0.2, 0.8)
+                soil_moisture = clamp(
+                    self.base_soil_moisture + self.random.uniform(-0.10, 0.10),0,1
+                )   #patch BEGINS around sensor-measured soil moisture, but slightly varies patch-to-patch for realism.
                 carbon = tree_density * 100
                 state = "healthy"
                 if soil_moisture < 0.30:
@@ -98,6 +153,8 @@ class ForestModel(mesa.Model):     #entire forest simulation
                 "TotalCarbon": ForestModel.total_carbon,
                 "StressedCount": ForestModel.stressed_count,
                 "AverageMoisture": ForestModel.average_moisture,
+                "Alert": lambda m: int(m.alert), #stores alert on/off as number 1 or 0
+                "IrrigationBoost": lambda m: m.irrigation_boost,
             }
         )
         self.datacollector.collect(self)
@@ -110,11 +167,22 @@ class ForestModel(mesa.Model):     #entire forest simulation
 
     def average_moisture(self):
         return sum(agent.soil_moisture for agent in self.agents) / len(self.agents)
+    
+    def update_adaptive_response(self):
+        stressed_ratio = self.stressed_count() / len(self.agents)
+
+        if self.adaptive_enabled and stressed_ratio >= self.stress_threshold:
+            self.alert = True
+            self.irrigation_boost = 0.02
+        else:
+            self.alert = False
+            self.irrigation_boost = 0.0
 
     def step(self):
-        self.agents.do("step")
-        self.agents.do("advance")
-        self.datacollector.collect(self)
+        self.update_adaptive_response() #check overall forest stress
+        self.agents.do("step") #decision
+        self.agents.do("advance") #patch update
+        self.datacollector.collect(self) #collect results
 
 def run_scenario(name, steps, **model_kwargs):
     model = ForestModel(5,5, **model_kwargs)
@@ -127,11 +195,16 @@ def run_scenario(name, steps, **model_kwargs):
     return results
 
 if __name__ == "__main__":
-    model = ForestModel(5, 5)
+    model = ForestModel(5, 5, seed=42)
     print("Model created successfully")
     print("Number of agents:", len(model.agents))
 
     patches = model.agents.to_list()
+
+    print("Base soil moisture:", f"{model.base_soil_moisture:.2f}")
+    print("Base temperature:", model.base_temp_c)
+    print("Base humidity:", f"{model.base_rh:.2f}")
+    print("Base drying rate:", f"{model.base_drying_rate:.4f}")
 
     print("\nFirst 5 patches BEFORE stepping:")
     for i, patch in enumerate(patches[:5], start=1):
@@ -158,6 +231,7 @@ if __name__ == "__main__":
     baseline = run_scenario(
         "Baseline",
         30,
+        csv_path="sensor_data.csv",
         base_drying_rate=0.03,
         rainfall=0.01,
         density_min=0.4,
@@ -168,6 +242,7 @@ if __name__ == "__main__":
     drought = run_scenario(
         "Drought",
         30,
+        csv_path="sensor_data.csv",
         base_drying_rate=0.05,
         rainfall=0.003,
         density_min=0.4,
@@ -178,10 +253,35 @@ if __name__ == "__main__":
     afforestation = run_scenario(
         "Afforestation",
         30,
+        csv_path="sensor_data.csv",
         base_drying_rate=0.03,
         rainfall=0.01,
         density_min=0.65,
         density_max=1.0,
+        seed=42
+    )
+
+    no_adapt = run_scenario(
+        "No Adaptation",
+        30,
+        csv_path="sensor_data.csv",
+        base_drying_rate=0.03,
+        rainfall=0.01,
+        density_min=0.4,
+        density_max=0.9,
+        adaptive_enabled=False,
+        seed=42
+    )
+
+    with_adapt = run_scenario(
+        "With Adaptation",
+        30,
+        csv_path="sensor_data.csv",
+        base_drying_rate=0.03,
+        rainfall=0.01,
+        density_min=0.4,
+        density_max=0.9,
+        adaptive_enabled=True,
         seed=42
     )
 
@@ -220,4 +320,51 @@ if __name__ == "__main__":
     plt.legend()
     plt.show()
 
+    plt.figure()
+    plt.plot(results["Alert"])
+    plt.xlabel("Step")
+    plt.ylabel("Alert State")
+    plt.title("Adaptive Alert Over Time")
+    plt.show()
 
+    plt.figure()
+    plt.plot(results["IrrigationBoost"])
+    plt.xlabel("Step")
+    plt.ylabel("Irrigation Boost")
+    plt.title("Adaptive Moisture Support Over Time")
+    plt.show()
+
+    plt.figure()
+    plt.plot(no_adapt["TotalCarbon"], label="No Adaptation")
+    plt.plot(with_adapt["TotalCarbon"], label="With Adaptation")
+    plt.xlabel("Step")
+    plt.ylabel("Total Carbon")
+    plt.title("Adaptive Comparison: Total Carbon")
+    plt.legend()
+    plt.show()
+
+    plt.figure()
+    plt.plot(no_adapt["StressedCount"], label="No Adaptation")
+    plt.plot(with_adapt["StressedCount"], label="With Adaptation")
+    plt.xlabel("Step")
+    plt.ylabel("Stressed Patches")
+    plt.title("Adaptive Comparison: Stressed Patches")
+    plt.legend()
+    plt.show()
+
+    plt.figure()
+    plt.plot(no_adapt["AverageMoisture"], label="No Adaptation")
+    plt.plot(with_adapt["AverageMoisture"], label="With Adaptation")
+    plt.xlabel("Step")
+    plt.ylabel("Average Moisture")
+    plt.title("Adaptive Comparison: Average Moisture")
+    plt.legend()
+    plt.show()
+
+    plt.figure()
+    plt.plot(with_adapt["Alert"], label="With Adaptation")
+    plt.xlabel("Step")
+    plt.ylabel("Alert State")
+    plt.title("Adaptive Alert Activation")
+    plt.legend()
+    plt.show()
